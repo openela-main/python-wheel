@@ -1,0 +1,1207 @@
+From c9309207bda86222908004b0ccf28c2a5a613f6e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Alex=20Gr=C3=B6nholm?= <alex.gronholm@nextday.fi>
+Date: Sat, 26 May 2018 20:02:20 +0300
+Subject: [PATCH] Removed wheel signing and verifying features
+
+This was discussed on the distutils-sig mailing list:
+https://mail.python.org/mm3/archives/list/distutils-sig@python.org/thread/MU2T6FRFNLRDEWSBJDRAFGDIFWCC6OIS/
+
+Fixes #196.
+---
+ setup.py                      |   3 -
+ tests/test_keys.py            |  93 ----------
+ tests/test_signatures.py      |  49 ------
+ tests/test_tool.py            |  27 ---
+ tox.ini                       |   5 +-
+ wheel/bdist_wheel.py          |   5 -
+ wheel/install.py              |  29 +--
+ wheel/metadata.py             |   3 -
+ wheel/signatures/__init__.py  | 110 ------------
+ wheel/signatures/djbec.py     | 323 ----------------------------------
+ wheel/signatures/ed25519py.py |  50 ------
+ wheel/signatures/keys.py      | 101 -----------
+ wheel/tool/__init__.py        | 143 +--------------
+ wheel/util.py                 |  41 -----
+ 14 files changed, 10 insertions(+), 972 deletions(-)
+ delete mode 100644 tests/test_keys.py
+ delete mode 100644 tests/test_signatures.py
+ delete mode 100644 wheel/signatures/__init__.py
+ delete mode 100644 wheel/signatures/djbec.py
+ delete mode 100644 wheel/signatures/ed25519py.py
+ delete mode 100644 wheel/signatures/keys.py
+
+diff --git a/setup.py b/setup.py
+index 10716db..61064cd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -39,9 +39,6 @@ setup(name='wheel',
+       packages=find_packages(),
+       python_requires=">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*",
+       extras_require={
+-          'signatures': ['keyring', 'keyrings.alt'],
+-          'signatures:sys_platform!="win32"': ['pyxdg'],
+-          'faster-signatures': ['ed25519ll'],
+           'test': ['pytest >= 3.0.0', 'pytest-cov']
+           },
+       include_package_data=True,
+diff --git a/tests/test_keys.py b/tests/test_keys.py
+deleted file mode 100644
+index 5c120ef..0000000
+--- a/tests/test_keys.py
++++ /dev/null
+@@ -1,93 +0,0 @@
+-import json
+-
+-import pytest
+-
+-from wheel.signatures import keys
+-
+-wheel_json = """
+-{
+-  "verifiers": [
+-    {
+-      "scope": "+",
+-      "vk": "bp-bjK2fFgtA-8DhKKAAPm9-eAZcX_u03oBv2RlKOBc"
+-    },
+-    {
+-      "scope": "+",
+-      "vk": "KAHZBfyqFW3OcFDbLSG4nPCjXxUPy72phP9I4Rn9MAo"
+-    },
+-    {
+-      "scope": "+",
+-      "vk": "tmAYCrSfj8gtJ10v3VkvW7jOndKmQIYE12hgnFu3cvk"
+-    }
+-  ],
+-  "signers": [
+-    {
+-      "scope": "+",
+-      "vk": "tmAYCrSfj8gtJ10v3VkvW7jOndKmQIYE12hgnFu3cvk"
+-    },
+-    {
+-      "scope": "+",
+-      "vk": "KAHZBfyqFW3OcFDbLSG4nPCjXxUPy72phP9I4Rn9MAo"
+-    }
+-  ],
+-  "schema": 1
+-}
+-"""
+-
+-
+-@pytest.fixture
+-def wheel_keys(tmpdir, monkeypatch):
+-    def load(*args):
+-        return [config_path.dirname]
+-
+-    def save(*args):
+-        return config_path.dirname
+-
+-    config_path = tmpdir.join('config.json')
+-    config_path.write(b'')
+-
+-    monkeypatch.setattr(keys, 'load_config_paths', load)
+-    monkeypatch.setattr(keys, 'save_config_path', save)
+-
+-    wk = keys.WheelKeys()
+-    wk.CONFIG_NAME = config_path.basename
+-    return wk
+-
+-
+-def test_load_save(wheel_keys):
+-    wheel_keys.data = json.loads(wheel_json)
+-
+-    wheel_keys.add_signer('+', '67890')
+-    wheel_keys.add_signer('scope', 'abcdefg')
+-
+-    wheel_keys.trust('epocs', 'gfedcba')
+-    wheel_keys.trust('+', '12345')
+-
+-    wheel_keys.save()
+-
+-    del wheel_keys.data
+-    wheel_keys.load()
+-
+-    signers = wheel_keys.signers('scope')
+-    assert signers[0] == ('scope', 'abcdefg'), wheel_keys.data['signers']
+-    assert signers[1][0] == '+', wheel_keys.data['signers']
+-
+-    trusted = wheel_keys.trusted('epocs')
+-    assert trusted[0] == ('epocs', 'gfedcba')
+-    assert trusted[1][0] == '+'
+-
+-    wheel_keys.untrust('epocs', 'gfedcba')
+-    trusted = wheel_keys.trusted('epocs')
+-    assert ('epocs', 'gfedcba') not in trusted
+-
+-
+-def test_load_save_incomplete(wheel_keys):
+-    wheel_keys.data = json.loads(wheel_json)
+-    del wheel_keys.data['signers']
+-    wheel_keys.data['schema'] = wheel_keys.SCHEMA+1
+-    wheel_keys.save()
+-    pytest.raises(ValueError, wheel_keys.load)
+-
+-    del wheel_keys.data['schema']
+-    wheel_keys.save()
+-    wheel_keys.load()
+diff --git a/tests/test_signatures.py b/tests/test_signatures.py
+deleted file mode 100644
+index aa0eb23..0000000
+--- a/tests/test_signatures.py
++++ /dev/null
+@@ -1,49 +0,0 @@
+-from wheel import signatures
+-from wheel.signatures import djbec, ed25519py
+-from wheel.util import binary
+-
+-
+-def test_getlib():
+-    signatures.get_ed25519ll()
+-
+-
+-def test_djbec():
+-    djbec.dsa_test()
+-    djbec.dh_test()
+-
+-
+-def test_ed25519py():
+-    kp0 = ed25519py.crypto_sign_keypair(binary(' '*32))
+-    kp = ed25519py.crypto_sign_keypair()
+-
+-    signed = ed25519py.crypto_sign(binary('test'), kp.sk)
+-
+-    ed25519py.crypto_sign_open(signed, kp.vk)
+-
+-    try:
+-        ed25519py.crypto_sign_open(signed, kp0.vk)
+-    except ValueError:
+-        pass
+-    else:
+-        raise Exception("Expected ValueError")
+-
+-    try:
+-        ed25519py.crypto_sign_keypair(binary(' '*33))
+-    except ValueError:
+-        pass
+-    else:
+-        raise Exception("Expected ValueError")
+-
+-    try:
+-        ed25519py.crypto_sign(binary(''), binary(' ')*31)
+-    except ValueError:
+-        pass
+-    else:
+-        raise Exception("Expected ValueError")
+-
+-    try:
+-        ed25519py.crypto_sign_open(binary(''), binary(' ')*31)
+-    except ValueError:
+-        pass
+-    else:
+-        raise Exception("Expected ValueError")
+diff --git a/tests/test_tool.py b/tests/test_tool.py
+index 60c9594..2af28e1 100644
+--- a/tests/test_tool.py
++++ b/tests/test_tool.py
+@@ -13,30 +13,3 @@ def test_unpack(wheel_paths, tmpdir):
+     """
+     for wheel_path in wheel_paths:
+         tool.unpack(wheel_path, str(tmpdir))
+-
+-
+-def test_keygen():
+-    def get_keyring():
+-        WheelKeys, keyring = tool.get_keyring()
+-
+-        class WheelKeysTest(WheelKeys):
+-            def save(self):
+-                pass
+-
+-        class keyringTest:
+-            @classmethod
+-            def get_keyring(cls):
+-                class keyringTest2:
+-                    pw = None
+-
+-                    def set_password(self, a, b, c):
+-                        self.pw = c
+-
+-                    def get_password(self, a, b):
+-                        return self.pw
+-
+-                return keyringTest2()
+-
+-        return WheelKeysTest, keyringTest
+-
+-    tool.keygen(get_keyring=get_keyring)
+diff --git a/tox.ini b/tox.ini
+index db3ac95..a19009c 100644
+--- a/tox.ini
++++ b/tox.ini
+@@ -10,10 +10,7 @@ skip_missing_interpreters = true
+ 
+ [testenv]
+ commands = python -m pytest
+-extras =
+-    tool
+-    signatures
+-    test
++extras = test
+ 
+ [testenv:flake8]
+ basepython = python2.7
+diff --git a/wheel/bdist_wheel.py b/wheel/bdist_wheel.py
+index 119e555..bb6257f 100644
+--- a/wheel/bdist_wheel.py
++++ b/wheel/bdist_wheel.py
+@@ -7,7 +7,6 @@ A wheel is a built archive format.
+ import csv
+ import hashlib
+ import os
+-import subprocess
+ import shutil
+ import sys
+ import re
+@@ -263,10 +262,6 @@ class bdist_wheel(Command):
+             os.makedirs(self.dist_dir)
+         wheel_name = archive_wheelfile(pseudoinstall_root, archive_root)
+ 
+-        # Sign the archive
+-        if 'WHEEL_TOOL' in os.environ:
+-            subprocess.call([os.environ['WHEEL_TOOL'], 'sign', wheel_name])
+-
+         # Add to 'Distribution.dist_files' so that the "upload" command works
+         getattr(self.distribution, 'dist_files', []).append(
+             ('bdist_wheel', get_python_version(), wheel_name))
+diff --git a/wheel/install.py b/wheel/install.py
+index 87f2e49..758198e 100644
+--- a/wheel/install.py
++++ b/wheel/install.py
+@@ -14,12 +14,10 @@ import sys
+ import warnings
+ import zipfile
+ 
+-from . import signatures
+ from .paths import get_install_paths
+ from .pep425tags import get_supported
+ from .pkginfo import read_pkg_info_bytes
+-from .util import (
+-    urlsafe_b64encode, from_json, urlsafe_b64decode, native, binary, HashingFile, open_for_csv)
++from .util import urlsafe_b64decode, native, binary, HashingFile, open_for_csv
+ 
+ try:
+     _big_number = sys.maxsize
+@@ -397,38 +395,25 @@ class WheelFile(object):
+             writer.writerow((self.record_name, '', ''))
+ 
+     def verify(self, zipfile=None):
+-        """Configure the VerifyingZipFile `zipfile` by verifying its signature
+-        and setting expected hashes for every hash in RECORD.
+-        Caller must complete the verification process by completely reading
+-        every file in the archive (e.g. with extractall)."""
+-        sig = None
++        """Configure the VerifyingZipFile `zipfile` by setting expected hashes for every hash in
++        RECORD. Caller must complete the verification process by completely reading every file in
++        the archive (e.g. with extractall).
++
++        """
+         if zipfile is None:
+             zipfile = self.zipfile
+         zipfile.strict = True
+ 
+         record_name = '/'.join((self.distinfo_name, 'RECORD'))
++        # tolerate JWS and s/mime signatures:
+         sig_name = '/'.join((self.distinfo_name, 'RECORD.jws'))
+-        # tolerate s/mime signatures:
+         smime_sig_name = '/'.join((self.distinfo_name, 'RECORD.p7s'))
+         zipfile.set_expected_hash(record_name, None)
+         zipfile.set_expected_hash(sig_name, None)
+         zipfile.set_expected_hash(smime_sig_name, None)
+         record = zipfile.read(record_name)
+ 
+-        record_digest = urlsafe_b64encode(hashlib.sha256(record).digest())
+-        try:
+-            sig = from_json(native(zipfile.read(sig_name)))
+-        except KeyError:  # no signature
+-            pass
+-        if sig:
+-            headers, payload = signatures.verify(sig)
+-            if payload['hash'] != "sha256=" + native(record_digest):
+-                msg = "RECORD.jws claimed RECORD hash {} != computed hash {}."
+-                raise BadWheelFile(msg.format(payload['hash'],
+-                                              native(record_digest)))
+-
+         reader = csv.reader((native(r, 'utf-8') for r in record.splitlines()))
+-
+         for row in reader:
+             filename = row[0]
+             hash = row[1]
+diff --git a/wheel/metadata.py b/wheel/metadata.py
+index 6aa495b..6e59f9a 100644
+--- a/wheel/metadata.py
++++ b/wheel/metadata.py
+@@ -5,7 +5,6 @@ Tools for converting old- to new-style metadata.
+ import os.path
+ import re
+ import textwrap
+-from collections import namedtuple
+ 
+ import pkg_resources
+ 
+@@ -15,8 +14,6 @@ from .pkginfo import read_pkg_info
+ # in METADATA/PKG-INFO. Support its syntax with the extra at the end only.
+ EXTRA_RE = re.compile("""^(?P<package>.*?)(;\s*(?P<condition>.*?)(extra == '(?P<extra>.*?)')?)$""")
+ 
+-MayRequiresKey = namedtuple('MayRequiresKey', ('condition', 'extra'))
+-
+ 
+ def requires_to_requires_dist(requirement):
+     """Compose the version predicates for requirement in PEP 345 fashion."""
+diff --git a/wheel/signatures/__init__.py b/wheel/signatures/__init__.py
+deleted file mode 100644
+index e7a5331..0000000
+--- a/wheel/signatures/__init__.py
++++ /dev/null
+@@ -1,110 +0,0 @@
+-"""
+-Create and verify jws-js format Ed25519 signatures.
+-"""
+-
+-import json
+-from ..util import urlsafe_b64decode, urlsafe_b64encode, native, binary
+-
+-__all__ = ['sign', 'verify']
+-
+-ed25519ll = None
+-
+-ALG = "Ed25519"
+-
+-
+-def get_ed25519ll():
+-    """Lazy import-and-test of ed25519 module"""
+-    global ed25519ll
+-
+-    if not ed25519ll:
+-        try:
+-            import ed25519ll  # fast (thousands / s)
+-        except (ImportError, OSError):  # pragma nocover
+-            from . import ed25519py as ed25519ll  # pure Python (hundreds / s)
+-        test()
+-
+-    return ed25519ll
+-
+-
+-def sign(payload, keypair):
+-    """Return a JWS-JS format signature given a JSON-serializable payload and
+-    an Ed25519 keypair."""
+-    get_ed25519ll()
+-    #
+-    header = {
+-                "alg": ALG,
+-                "jwk": {
+-                    "kty": ALG,  # alg -> kty in jwk-08.
+-                    "vk": native(urlsafe_b64encode(keypair.vk))
+-                }
+-             }
+-
+-    encoded_header = urlsafe_b64encode(binary(json.dumps(header, sort_keys=True)))
+-    encoded_payload = urlsafe_b64encode(binary(json.dumps(payload, sort_keys=True)))
+-    secured_input = b".".join((encoded_header, encoded_payload))
+-    sig_msg = ed25519ll.crypto_sign(secured_input, keypair.sk)
+-    signature = sig_msg[:ed25519ll.SIGNATUREBYTES]
+-    encoded_signature = urlsafe_b64encode(signature)
+-
+-    return {"recipients":
+-            [{"header": native(encoded_header),
+-              "signature": native(encoded_signature)}],
+-            "payload": native(encoded_payload)}
+-
+-
+-def assertTrue(condition, message=""):
+-    if not condition:
+-        raise ValueError(message)
+-
+-
+-def verify(jwsjs):
+-    """Return (decoded headers, payload) if all signatures in jwsjs are
+-    consistent, else raise ValueError.
+-
+-    Caller must decide whether the keys are actually trusted."""
+-    get_ed25519ll()
+-    # XXX forbid duplicate keys in JSON input using object_pairs_hook (2.7+)
+-    recipients = jwsjs["recipients"]
+-    encoded_payload = binary(jwsjs["payload"])
+-    headers = []
+-    for recipient in recipients:
+-        assertTrue(len(recipient) == 2, "Unknown recipient key {0}".format(recipient))
+-        h = binary(recipient["header"])
+-        s = binary(recipient["signature"])
+-        header = json.loads(native(urlsafe_b64decode(h)))
+-        assertTrue(header["alg"] == ALG,
+-                   "Unexpected algorithm {0}".format(header["alg"]))
+-        if "alg" in header["jwk"] and "kty" not in header["jwk"]:
+-            header["jwk"]["kty"] = header["jwk"]["alg"]  # b/w for JWK < -08
+-        assertTrue(header["jwk"]["kty"] == ALG,  # true for Ed25519
+-                   "Unexpected key type {0}".format(header["jwk"]["kty"]))
+-        vk = urlsafe_b64decode(binary(header["jwk"]["vk"]))
+-        secured_input = b".".join((h, encoded_payload))
+-        sig = urlsafe_b64decode(s)
+-        sig_msg = sig+secured_input
+-        verified_input = native(ed25519ll.crypto_sign_open(sig_msg, vk))
+-        verified_header, verified_payload = verified_input.split('.')
+-        verified_header = binary(verified_header)
+-        decoded_header = native(urlsafe_b64decode(verified_header))
+-        headers.append(json.loads(decoded_header))
+-
+-    verified_payload = binary(verified_payload)
+-
+-    # only return header, payload that have passed through the crypto library.
+-    payload = json.loads(native(urlsafe_b64decode(verified_payload)))
+-
+-    return headers, payload
+-
+-
+-def test():
+-    kp = ed25519ll.crypto_sign_keypair()
+-    payload = {'test': 'onstartup'}
+-    jwsjs = json.loads(json.dumps(sign(payload, kp)))
+-    verify(jwsjs)
+-    jwsjs['payload'] += 'x'
+-    try:
+-        verify(jwsjs)
+-    except ValueError:
+-        pass
+-    else:  # pragma no cover
+-        raise RuntimeError("No error from bad wheel.signatures payload.")
+diff --git a/wheel/signatures/djbec.py b/wheel/signatures/djbec.py
+deleted file mode 100644
+index e9b3115..0000000
+--- a/wheel/signatures/djbec.py
++++ /dev/null
+@@ -1,323 +0,0 @@
+-# Ed25519 digital signatures
+-# Based on https://ed25519.cr.yp.to/python/ed25519.py
+-# See also https://ed25519.cr.yp.to/software.html
+-# Adapted by Ron Garret
+-# Sped up considerably using coordinate transforms found on:
+-# https://www.hyperelliptic.org/EFD/g1p/auto-twisted-extended-1.html
+-# Specifically add-2008-hwcd-4 and dbl-2008-hwcd
+-
+-import hashlib
+-import random
+-
+-try:  # pragma nocover
+-    unicode
+-    PY3 = False
+-
+-    def asbytes(b):
+-        """Convert array of integers to byte string"""
+-        return ''.join(chr(x) for x in b)
+-
+-    def joinbytes(b):
+-        """Convert array of bytes to byte string"""
+-        return ''.join(b)
+-
+-    def bit(h, i):
+-        """Return i'th bit of bytestring h"""
+-        return (ord(h[i // 8]) >> (i % 8)) & 1
+-except NameError:  # pragma nocover
+-    PY3 = True
+-    asbytes = bytes
+-    joinbytes = bytes
+-
+-    def bit(h, i):
+-        return (h[i // 8] >> (i % 8)) & 1
+-
+-b = 256
+-q = 2 ** 255 - 19
+-l = 2 ** 252 + 27742317777372353535851937790883648493  # noqa: E741
+-
+-
+-def H(m):
+-    return hashlib.sha512(m).digest()
+-
+-
+-def expmod(b, e, m):
+-    if e == 0:
+-        return 1
+-
+-    t = expmod(b, e // 2, m) ** 2 % m
+-    if e & 1:
+-        t = (t * b) % m
+-
+-    return t
+-
+-
+-# Can probably get some extra speedup here by replacing this with
+-# an extended-euclidean, but performance seems OK without that
+-def inv(x):
+-    return expmod(x, q - 2, q)
+-
+-
+-d = -121665 * inv(121666)
+-I = expmod(2, (q - 1) // 4, q)  # noqa: E741
+-
+-
+-def xrecover(y):
+-    xx = (y * y - 1) * inv(d * y * y + 1)
+-    x = expmod(xx, (q + 3) // 8, q)
+-    if (x * x - xx) % q != 0:
+-        x = (x * I) % q
+-
+-    if x % 2 != 0:
+-        x = q - x
+-
+-    return x
+-
+-
+-By = 4 * inv(5)
+-Bx = xrecover(By)
+-B = [Bx % q, By % q]
+-
+-
+-# def edwards(P,Q):
+-#    x1 = P[0]
+-#    y1 = P[1]
+-#    x2 = Q[0]
+-#    y2 = Q[1]
+-#    x3 = (x1*y2+x2*y1) * inv(1+d*x1*x2*y1*y2)
+-#    y3 = (y1*y2+x1*x2) * inv(1-d*x1*x2*y1*y2)
+-#    return (x3 % q,y3 % q)
+-
+-# def scalarmult(P,e):
+-#    if e == 0: return [0,1]
+-#    Q = scalarmult(P,e/2)
+-#    Q = edwards(Q,Q)
+-#    if e & 1: Q = edwards(Q,P)
+-#    return Q
+-
+-# Faster (!) version based on:
+-# https://www.hyperelliptic.org/EFD/g1p/auto-twisted-extended-1.html
+-
+-def xpt_add(pt1, pt2):
+-    (X1, Y1, Z1, T1) = pt1
+-    (X2, Y2, Z2, T2) = pt2
+-    A = ((Y1 - X1) * (Y2 + X2)) % q
+-    B = ((Y1 + X1) * (Y2 - X2)) % q
+-    C = (Z1 * 2 * T2) % q
+-    D = (T1 * 2 * Z2) % q
+-    E = (D + C) % q
+-    F = (B - A) % q
+-    G = (B + A) % q
+-    H = (D - C) % q
+-    X3 = (E * F) % q
+-    Y3 = (G * H) % q
+-    Z3 = (F * G) % q
+-    T3 = (E * H) % q
+-    return (X3, Y3, Z3, T3)
+-
+-
+-def xpt_double(pt):
+-    (X1, Y1, Z1, _) = pt
+-    A = (X1 * X1)
+-    B = (Y1 * Y1)
+-    C = (2 * Z1 * Z1)
+-    D = (-A) % q
+-    J = (X1 + Y1) % q
+-    E = (J * J - A - B) % q
+-    G = (D + B) % q
+-    F = (G - C) % q
+-    H = (D - B) % q
+-    X3 = (E * F) % q
+-    Y3 = (G * H) % q
+-    Z3 = (F * G) % q
+-    T3 = (E * H) % q
+-    return X3, Y3, Z3, T3
+-
+-
+-def pt_xform(pt):
+-    (x, y) = pt
+-    return x, y, 1, (x * y) % q
+-
+-
+-def pt_unxform(pt):
+-    (x, y, z, _) = pt
+-    return (x * inv(z)) % q, (y * inv(z)) % q
+-
+-
+-def xpt_mult(pt, n):
+-    if n == 0:
+-        return pt_xform((0, 1))
+-
+-    _ = xpt_double(xpt_mult(pt, n >> 1))
+-    return xpt_add(_, pt) if n & 1 else _
+-
+-
+-def scalarmult(pt, e):
+-    return pt_unxform(xpt_mult(pt_xform(pt), e))
+-
+-
+-def encodeint(y):
+-    bits = [(y >> i) & 1 for i in range(b)]
+-    e = [(sum([bits[i * 8 + j] << j for j in range(8)]))
+-         for i in range(b // 8)]
+-    return asbytes(e)
+-
+-
+-def encodepoint(P):
+-    x = P[0]
+-    y = P[1]
+-    bits = [(y >> i) & 1 for i in range(b - 1)] + [x & 1]
+-    e = [(sum([bits[i * 8 + j] << j for j in range(8)]))
+-         for i in range(b // 8)]
+-    return asbytes(e)
+-
+-
+-def publickey(sk):
+-    h = H(sk)
+-    a = 2 ** (b - 2) + sum(2 ** i * bit(h, i) for i in range(3, b - 2))
+-    A = scalarmult(B, a)
+-    return encodepoint(A)
+-
+-
+-def Hint(m):
+-    h = H(m)
+-    return sum(2 ** i * bit(h, i) for i in range(2 * b))
+-
+-
+-def signature(m, sk, pk):
+-    h = H(sk)
+-    a = 2 ** (b - 2) + sum(2 ** i * bit(h, i) for i in range(3, b - 2))
+-    inter = joinbytes([h[i] for i in range(b // 8, b // 4)])
+-    r = Hint(inter + m)
+-    R = scalarmult(B, r)
+-    S = (r + Hint(encodepoint(R) + pk + m) * a) % l
+-    return encodepoint(R) + encodeint(S)
+-
+-
+-def isoncurve(P):
+-    x = P[0]
+-    y = P[1]
+-    return (-x * x + y * y - 1 - d * x * x * y * y) % q == 0
+-
+-
+-def decodeint(s):
+-    return sum(2 ** i * bit(s, i) for i in range(0, b))
+-
+-
+-def decodepoint(s):
+-    y = sum(2 ** i * bit(s, i) for i in range(0, b - 1))
+-    x = xrecover(y)
+-    if x & 1 != bit(s, b - 1):
+-        x = q - x
+-
+-    P = [x, y]
+-    if not isoncurve(P):
+-        raise Exception("decoding point that is not on curve")
+-
+-    return P
+-
+-
+-def checkvalid(s, m, pk):
+-    if len(s) != b // 4:
+-        raise Exception("signature length is wrong")
+-    if len(pk) != b // 8:
+-        raise Exception("public-key length is wrong")
+-
+-    R = decodepoint(s[0:b // 8])
+-    A = decodepoint(pk)
+-    S = decodeint(s[b // 8:b // 4])
+-    h = Hint(encodepoint(R) + pk + m)
+-    v1 = scalarmult(B, S)
+-    #  v2 = edwards(R,scalarmult(A,h))
+-    v2 = pt_unxform(xpt_add(pt_xform(R), pt_xform(scalarmult(A, h))))
+-    return v1 == v2
+-
+-
+-##########################################################
+-#
+-# Curve25519 reference implementation by Matthew Dempsky, from:
+-# https://cr.yp.to/highspeed/naclcrypto-20090310.pdf
+-
+-# P = 2 ** 255 - 19
+-P = q
+-A = 486662
+-
+-
+-# def expmod(b, e, m):
+-#    if e == 0: return 1
+-#    t = expmod(b, e / 2, m) ** 2 % m
+-#    if e & 1: t = (t * b) % m
+-#    return t
+-
+-# def inv(x): return expmod(x, P - 2, P)
+-
+-
+-def add(n, m, d):
+-    (xn, zn) = n
+-    (xm, zm) = m
+-    (xd, zd) = d
+-    x = 4 * (xm * xn - zm * zn) ** 2 * zd
+-    z = 4 * (xm * zn - zm * xn) ** 2 * xd
+-    return (x % P, z % P)
+-
+-
+-def double(n):
+-    (xn, zn) = n
+-    x = (xn ** 2 - zn ** 2) ** 2
+-    z = 4 * xn * zn * (xn ** 2 + A * xn * zn + zn ** 2)
+-    return (x % P, z % P)
+-
+-
+-def curve25519(n, base=9):
+-    one = (base, 1)
+-    two = double(one)
+-
+-    # f(m) evaluates to a tuple
+-    # containing the mth multiple and the
+-    # (m+1)th multiple of base.
+-    def f(m):
+-        if m == 1:
+-            return (one, two)
+-
+-        (pm, pm1) = f(m // 2)
+-        if m & 1:
+-            return (add(pm, pm1, one), double(pm1))
+-
+-        return (double(pm), add(pm, pm1, one))
+-
+-    ((x, z), _) = f(n)
+-    return (x * inv(z)) % P
+-
+-
+-def genkey(n=0):
+-    n = n or random.randint(0, P)
+-    n &= ~7
+-    n &= ~(128 << 8 * 31)
+-    n |= 64 << 8 * 31
+-    return n
+-
+-
+-# def str2int(s):
+-#    return int(hexlify(s), 16)
+-#    # return sum(ord(s[i]) << (8 * i) for i in range(32))
+-#
+-# def int2str(n):
+-#    return unhexlify("%x" % n)
+-#    # return ''.join([chr((n >> (8 * i)) & 255) for i in range(32)])
+-
+-#################################################
+-
+-
+-def dsa_test():
+-    import os
+-    msg = str(random.randint(q, q + q)).encode('utf-8')
+-    sk = os.urandom(32)
+-    pk = publickey(sk)
+-    sig = signature(msg, sk, pk)
+-    return checkvalid(sig, msg, pk)
+-
+-
+-def dh_test():
+-    sk1 = genkey()
+-    sk2 = genkey()
+-    return curve25519(sk1, curve25519(sk2)) == curve25519(sk2, curve25519(sk1))
+diff --git a/wheel/signatures/ed25519py.py b/wheel/signatures/ed25519py.py
+deleted file mode 100644
+index 0c4ab8f..0000000
+--- a/wheel/signatures/ed25519py.py
++++ /dev/null
+@@ -1,50 +0,0 @@
+-import os
+-import warnings
+-from collections import namedtuple
+-
+-from . import djbec
+-
+-__all__ = ['crypto_sign', 'crypto_sign_open', 'crypto_sign_keypair', 'Keypair',
+-           'PUBLICKEYBYTES', 'SECRETKEYBYTES', 'SIGNATUREBYTES']
+-
+-PUBLICKEYBYTES = 32
+-SECRETKEYBYTES = 64
+-SIGNATUREBYTES = 64
+-
+-Keypair = namedtuple('Keypair', ('vk', 'sk'))  # verifying key, secret key
+-
+-
+-def crypto_sign_keypair(seed=None):
+-    """Return (verifying, secret) key from a given seed, or os.urandom(32)"""
+-    if seed is None:
+-        seed = os.urandom(PUBLICKEYBYTES)
+-    else:
+-        warnings.warn("ed25519ll should choose random seed.",
+-                      RuntimeWarning)
+-    if len(seed) != 32:
+-        raise ValueError("seed must be 32 random bytes or None.")
+-    skbytes = seed
+-    vkbytes = djbec.publickey(skbytes)
+-    return Keypair(vkbytes, skbytes+vkbytes)
+-
+-
+-def crypto_sign(msg, sk):
+-    """Return signature+message given message and secret key.
+-    The signature is the first SIGNATUREBYTES bytes of the return value.
+-    A copy of msg is in the remainder."""
+-    if len(sk) != SECRETKEYBYTES:
+-        raise ValueError("Bad signing key length %d" % len(sk))
+-    vkbytes = sk[PUBLICKEYBYTES:]
+-    skbytes = sk[:PUBLICKEYBYTES]
+-    sig = djbec.signature(msg, skbytes, vkbytes)
+-    return sig + msg
+-
+-
+-def crypto_sign_open(signed, vk):
+-    """Return message given signature+message and the verifying key."""
+-    if len(vk) != PUBLICKEYBYTES:
+-        raise ValueError("Bad verifying key length %d" % len(vk))
+-    rc = djbec.checkvalid(signed[:SIGNATUREBYTES], signed[SIGNATUREBYTES:], vk)
+-    if not rc:
+-        raise ValueError("rc != True", rc)
+-    return signed[SIGNATUREBYTES:]
+diff --git a/wheel/signatures/keys.py b/wheel/signatures/keys.py
+deleted file mode 100644
+index eb5d4ac..0000000
+--- a/wheel/signatures/keys.py
++++ /dev/null
+@@ -1,101 +0,0 @@
+-"""Store and retrieve wheel signing / verifying keys.
+-
+-Given a scope (a package name, + meaning "all packages", or - meaning
+-"no packages"), return a list of verifying keys that are trusted for that
+-scope.
+-
+-Given a package name, return a list of (scope, key) suggested keys to sign
+-that package (only the verifying keys; the private signing key is stored
+-elsewhere).
+-
+-Keys here are represented as urlsafe_b64encoded strings with no padding.
+-
+-Tentative command line interface:
+-
+-# list trusts
+-wheel trust
+-# trust a particular key for all
+-wheel trust + key
+-# trust key for beaglevote
+-wheel trust beaglevote key
+-# stop trusting a key for all
+-wheel untrust + key
+-
+-# generate a key pair
+-wheel keygen
+-
+-# import a signing key from a file
+-wheel import keyfile
+-
+-# export a signing key
+-wheel export key
+-"""
+-
+-import json
+-import os.path
+-
+-from ..util import native, load_config_paths, save_config_path
+-
+-
+-class WheelKeys(object):
+-    SCHEMA = 1
+-    CONFIG_NAME = 'wheel.json'
+-
+-    def __init__(self):
+-        self.data = {'signers': [], 'verifiers': []}
+-
+-    def load(self):
+-        # XXX JSON is not a great database
+-        for path in load_config_paths('wheel'):
+-            conf = os.path.join(native(path), self.CONFIG_NAME)
+-            if os.path.exists(conf):
+-                with open(conf, 'r') as infile:
+-                    self.data = json.load(infile)
+-                    for x in ('signers', 'verifiers'):
+-                        if x not in self.data:
+-                            self.data[x] = []
+-                    if 'schema' not in self.data:
+-                        self.data['schema'] = self.SCHEMA
+-                    elif self.data['schema'] != self.SCHEMA:
+-                        raise ValueError(
+-                            "Bad wheel.json version {0}, expected {1}".format(
+-                                self.data['schema'], self.SCHEMA))
+-                break
+-        return self
+-
+-    def save(self):
+-        # Try not to call this a very long time after load()
+-        path = save_config_path('wheel')
+-        conf = os.path.join(native(path), self.CONFIG_NAME)
+-        with open(conf, 'w+') as out:
+-            json.dump(self.data, out, indent=2)
+-        return self
+-
+-    def trust(self, scope, vk):
+-        """Start trusting a particular key for given scope."""
+-        self.data['verifiers'].append({'scope': scope, 'vk': vk})
+-        return self
+-
+-    def untrust(self, scope, vk):
+-        """Stop trusting a particular key for given scope."""
+-        self.data['verifiers'].remove({'scope': scope, 'vk': vk})
+-        return self
+-
+-    def trusted(self, scope=None):
+-        """Return list of [(scope, trusted key), ...] for given scope."""
+-        trust = [(x['scope'], x['vk']) for x in self.data['verifiers']
+-                 if x['scope'] in (scope, '+')]
+-        trust.sort(key=lambda x: x[0])
+-        trust.reverse()
+-        return trust
+-
+-    def signers(self, scope):
+-        """Return list of signing key(s)."""
+-        sign = [(x['scope'], x['vk']) for x in self.data['signers'] if x['scope'] in (scope, '+')]
+-        sign.sort(key=lambda x: x[0])
+-        sign.reverse()
+-        return sign
+-
+-    def add_signer(self, scope, vk):
+-        """Remember verifying key vk as being valid for signing in scope."""
+-        self.data['signers'].append({'scope': scope, 'vk': vk})
+diff --git a/wheel/tool/__init__.py b/wheel/tool/__init__.py
+index 36292dc..9cbdc08 100644
+--- a/wheel/tool/__init__.py
++++ b/wheel/tool/__init__.py
+@@ -5,16 +5,13 @@ Wheel command-line utility.
+ from __future__ import print_function
+ 
+ import argparse
+-import hashlib
+-import json
+ import os
+ import sys
+ from glob import iglob
+ 
+-from .. import signatures
+-from ..install import WheelFile, VerifyingZipFile
++from ..install import WheelFile
+ from ..paths import get_install_command
+-from ..util import urlsafe_b64decode, urlsafe_b64encode, native, binary, matches_requirement
++from ..util import matches_requirement
+ 
+ 
+ def require_pkgresources(name):
+@@ -28,119 +25,6 @@ class WheelError(Exception):
+     pass
+ 
+ 
+-# For testability
+-def get_keyring():
+-    try:
+-        from ..signatures import keys
+-        import keyring
+-        assert keyring.get_keyring().priority
+-    except (ImportError, AssertionError):
+-        raise WheelError(
+-            "Install wheel[signatures] (requires keyring, keyrings.alt, pyxdg) for signatures.")
+-
+-    return keys.WheelKeys, keyring
+-
+-
+-def warn_signatures():
+-    print('WARNING: The wheel signing and signature verification commands have been deprecated '
+-          'and will be removed before the v1.0.0 release.', file=sys.stderr)
+-
+-
+-def keygen(get_keyring=get_keyring):
+-    """Generate a public/private key pair."""
+-    warn_signatures()
+-    WheelKeys, keyring = get_keyring()
+-
+-    ed25519ll = signatures.get_ed25519ll()
+-
+-    wk = WheelKeys().load()
+-
+-    keypair = ed25519ll.crypto_sign_keypair()
+-    vk = native(urlsafe_b64encode(keypair.vk))
+-    sk = native(urlsafe_b64encode(keypair.sk))
+-    kr = keyring.get_keyring()
+-    kr.set_password("wheel", vk, sk)
+-    print("Created Ed25519 keypair with vk={}".format(vk))
+-    print("in {!r}".format(kr))
+-
+-    sk2 = kr.get_password('wheel', vk)
+-    if sk2 != sk:
+-        raise WheelError("Keyring is broken. Could not retrieve secret key.")
+-
+-    print("Trusting {} to sign and verify all packages.".format(vk))
+-    wk.add_signer('+', vk)
+-    wk.trust('+', vk)
+-    wk.save()
+-
+-
+-def sign(wheelfile, replace=False, get_keyring=get_keyring):
+-    """Sign a wheel"""
+-    warn_signatures()
+-    WheelKeys, keyring = get_keyring()
+-
+-    ed25519ll = signatures.get_ed25519ll()
+-
+-    wf = WheelFile(wheelfile, append=True)
+-    wk = WheelKeys().load()
+-
+-    name = wf.parsed_filename.group('name')
+-    sign_with = wk.signers(name)[0]
+-    print("Signing {} with {}".format(name, sign_with[1]))
+-
+-    vk = sign_with[1]
+-    kr = keyring.get_keyring()
+-    sk = kr.get_password('wheel', vk)
+-    keypair = ed25519ll.Keypair(urlsafe_b64decode(binary(vk)),
+-                                urlsafe_b64decode(binary(sk)))
+-
+-    record_name = wf.distinfo_name + '/RECORD'
+-    sig_name = wf.distinfo_name + '/RECORD.jws'
+-    if sig_name in wf.zipfile.namelist():
+-        raise WheelError("Wheel is already signed.")
+-    record_data = wf.zipfile.read(record_name)
+-    payload = {"hash": "sha256=" + native(urlsafe_b64encode(hashlib.sha256(record_data).digest()))}
+-    sig = signatures.sign(payload, keypair)
+-    wf.zipfile.writestr(sig_name, json.dumps(sig, sort_keys=True))
+-    wf.zipfile.close()
+-
+-
+-def unsign(wheelfile):
+-    """
+-    Remove RECORD.jws from a wheel by truncating the zip file.
+-
+-    RECORD.jws must be at the end of the archive. The zip file must be an
+-    ordinary archive, with the compressed files and the directory in the same
+-    order, and without any non-zip content after the truncation point.
+-    """
+-    warn_signatures()
+-    vzf = VerifyingZipFile(wheelfile, "a")
+-    info = vzf.infolist()
+-    if not (len(info) and info[-1].filename.endswith('/RECORD.jws')):
+-        raise WheelError('The wheel is not signed (RECORD.jws not found at end of the archive).')
+-    vzf.pop()
+-    vzf.close()
+-
+-
+-def verify(wheelfile):
+-    """Verify a wheel.
+-
+-    The signature will be verified for internal consistency ONLY and printed.
+-    Wheel's own unpack/install commands verify the manifest against the
+-    signature and file contents.
+-    """
+-    warn_signatures()
+-    wf = WheelFile(wheelfile)
+-    sig_name = wf.distinfo_name + '/RECORD.jws'
+-    try:
+-        sig = json.loads(native(wf.zipfile.open(sig_name).read()))
+-    except KeyError:
+-        raise WheelError('The wheel is not signed (RECORD.jws not found at end of the archive).')
+-
+-    verified = signatures.verify(sig)
+-    print("Signatures are internally consistent.", file=sys.stderr)
+-    print(json.dumps(verified, indent=2))
+-
+-
+ def unpack(wheelfile, dest='.'):
+     """Unpack a wheel.
+ 
+@@ -288,29 +172,6 @@ def parser():
+     p = argparse.ArgumentParser()
+     s = p.add_subparsers(help="commands")
+ 
+-    def keygen_f(args):
+-        keygen()
+-    keygen_parser = s.add_parser('keygen', help='Generate signing key')
+-    keygen_parser.set_defaults(func=keygen_f)
+-
+-    def sign_f(args):
+-        sign(args.wheelfile)
+-    sign_parser = s.add_parser('sign', help='Sign wheel')
+-    sign_parser.add_argument('wheelfile', help='Wheel file')
+-    sign_parser.set_defaults(func=sign_f)
+-
+-    def unsign_f(args):
+-        unsign(args.wheelfile)
+-    unsign_parser = s.add_parser('unsign', help=unsign.__doc__)
+-    unsign_parser.add_argument('wheelfile', help='Wheel file')
+-    unsign_parser.set_defaults(func=unsign_f)
+-
+-    def verify_f(args):
+-        verify(args.wheelfile)
+-    verify_parser = s.add_parser('verify', help=verify.__doc__)
+-    verify_parser.add_argument('wheelfile', help='Wheel file')
+-    verify_parser.set_defaults(func=verify_f)
+-
+     def unpack_f(args):
+         unpack(args.wheelfile, args.dest)
+     unpack_parser = s.add_parser('unpack', help='Unpack wheel')
+diff --git a/wheel/util.py b/wheel/util.py
+index 71802bf..a4f990a 100644
+--- a/wheel/util.py
++++ b/wheel/util.py
+@@ -1,17 +1,12 @@
+-"""Utility functions."""
+-
+ import base64
+ import hashlib
+ import json
+-import os
+ import sys
+ 
+ __all__ = ['urlsafe_b64encode', 'urlsafe_b64decode', 'utf8',
+            'to_json', 'from_json', 'matches_requirement']
+ 
+ 
+-# For encoding ascii back and forth between bytestrings, as is repeatedly
+-# necessary in JSON-based crypto under Python 3
+ if sys.version_info[0] < 3:
+     text_type = unicode  # noqa: F821
+ 
+@@ -98,42 +93,6 @@ class HashingFile(object):
+         self.fd.close()
+ 
+ 
+-if sys.platform == 'win32':
+-    import ctypes.wintypes
+-    # CSIDL_APPDATA for reference - not used here for compatibility with
+-    # dirspec, which uses LOCAL_APPDATA and COMMON_APPDATA in that order
+-    csidl = {'CSIDL_APPDATA': 26, 'CSIDL_LOCAL_APPDATA': 28, 'CSIDL_COMMON_APPDATA': 35}
+-
+-    def get_path(name):
+-        SHGFP_TYPE_CURRENT = 0
+-        buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+-        ctypes.windll.shell32.SHGetFolderPathW(0, csidl[name], 0, SHGFP_TYPE_CURRENT, buf)
+-        return buf.value
+-
+-    def save_config_path(*resource):
+-        appdata = get_path("CSIDL_LOCAL_APPDATA")
+-        path = os.path.join(appdata, *resource)
+-        if not os.path.isdir(path):
+-            os.makedirs(path)
+-        return path
+-
+-    def load_config_paths(*resource):
+-        ids = ["CSIDL_LOCAL_APPDATA", "CSIDL_COMMON_APPDATA"]
+-        for id in ids:
+-            base = get_path(id)
+-            path = os.path.join(base, *resource)
+-            if os.path.exists(path):
+-                yield path
+-else:
+-    def save_config_path(*resource):
+-        import xdg.BaseDirectory
+-        return xdg.BaseDirectory.save_config_path(*resource)
+-
+-    def load_config_paths(*resource):
+-        import xdg.BaseDirectory
+-        return xdg.BaseDirectory.load_config_paths(*resource)
+-
+-
+ def matches_requirement(req, wheels):
+     """List of wheels matching a requirement.
+ 
+-- 
+2.20.1
+
