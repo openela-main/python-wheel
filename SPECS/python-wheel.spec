@@ -18,7 +18,7 @@
 
 Name:           python-%{pypi_name}
 Version:        0.36.2
-Release:        7%{?dist}
+Release:        8%{?dist}
 Epoch:          1
 Summary:        Built-package format for Python
 
@@ -27,6 +27,13 @@ License:        MIT and (ASL 2.0 or BSD)
 URL:            https://github.com/pypa/wheel
 Source0:        %{url}/archive/%{version}/%{pypi_name}-%{version}.tar.gz
 BuildArch:      noarch
+
+# Security fix for CVE-2022-40898
+# Regex Fix which causes regression in wheel filename parsing:
+# https://github.com/pypa/wheel/commit/88f02bc335d5404991e532e7f3b0fc80437bf4e0
+# Wheel filename regression fix:
+# https://github.com/pypa/wheel/commit/44193907eb308930de05deed863fb4d157c5c866
+Patch: CVE-2022-40898.patch
 
 BuildRequires:  python%{python3_pkgversion}-devel
 BuildRequires:  python%{python3_pkgversion}-setuptools
@@ -136,6 +143,10 @@ rm setup.cfg  # to drop pytest coverage options configured there
 %endif
 
 %changelog
+* Tue Apr 25 2023 Ryan Erickson <rerickso@redhat.com> - 1:0.36.2-8
+- Security fix for CVE-2022-40898
+- Resolves: rhbz#2178881
+
 * Tue Feb 08 2022 Tomáš Hrnčiar <thrnciar@redhat.com> - 1:0.36.2-7
 - Add automatically generated Obsoletes tag with the python39- prefix
   for smoother upgrade from RHEL8
